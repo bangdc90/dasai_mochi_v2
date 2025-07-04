@@ -3,6 +3,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <DFRobotDFPlayerMini.h> // Thêm thư viện DFPlayer Mini
 
 // ===== CONFIG =====
 // Các giá trị cấu hình có thể được thay đổi dễ dàng
@@ -13,15 +14,18 @@ namespace Config {
   constexpr uint16_t VIDEO_DELAY_MS = 300;
   
   // GPIO và cảm biến
-  constexpr uint8_t BUTTON_PIN = 5;
-  constexpr uint8_t ADC_PIN = 8;
+  constexpr uint8_t BUTTON_PIN = 13;
+  constexpr uint8_t ADC_PIN = 12;
   constexpr uint16_t ADC_THRESHOLD = 2500;
   constexpr uint8_t DEBOUNCE_TIME_MS = 50;
-  constexpr uint16_t HOLDING_TIME_MS = 1000;
+  constexpr uint16_t HOLDING_TIME_MS = 200;
 
   // Chỉ số video đặc biệt
-  constexpr uint8_t INTRO_VIDEO_INDEX = 0;  // video01
+  constexpr uint8_t SLEEP_VIDEO_INDEX = 0;  // video01
   constexpr uint8_t SPECIAL_VIDEO_INDEX = 7; // video08
+  
+  // Audio
+  constexpr uint8_t AUDIO_VOLUME = 20; // Âm lượng (0-30)
 }
 
 // ===== CÁC KIỂU DỮ LIỆU =====
@@ -29,13 +33,14 @@ typedef struct _VideoInfo {
   const uint8_t* const* frames;
   const uint16_t* frames_size;
   uint16_t num_frames;
+  uint8_t audio_idx;  // Thêm trường audio_idx
 } VideoInfo;
 
 // State machine cho player
 enum class PlayerState {
   NORMAL_PLAYBACK,
   PLAY_SPECIAL_VIDEO,
-  PLAY_INTRO_VIDEO,
+  PLAY_SLEEP_VIDEO,
   SKIP_CURRENT,
   LOOP_CURRENT    // Thêm trạng thái lặp video hiện tại
 };
@@ -63,6 +68,8 @@ struct InputState {
 };
 
 // ===== KHAI BÁO VIDEOS =====
+// Lưu ý: Bạn cần cập nhật định nghĩa VideoInfo trong các file video
+// để bao gồm audio_idx hoặc sử dụng phương pháp ánh xạ đã đề cập
 #include "video01.h"
 #include "video02.h"
 #include "video03.h"
@@ -125,6 +132,86 @@ public:
   }
 };
 
+// ===== QUẢN LÝ AUDIO =====
+class AudioManager {
+private:
+  DFRobotDFPlayerMini _dfPlayer;
+  bool _isPlaying = false;
+  uint8_t _currentTrack = 0;
+  unsigned long _lastCommandTime = 0;
+  static constexpr unsigned long MIN_COMMAND_INTERVAL = 50; // Thời gian tối thiểu giữa các lệnh gửi đến DFPlayer (ms)
+
+public:
+  AudioManager() {}
+  
+  void init() {
+    Serial2.begin(9600); // Khởi tạo Serial2 với baud rate 9600 (chuẩn cho DFPlayer)
+    
+    Serial.println("Initializing DFPlayer...");
+    if (!_dfPlayer.begin(Serial2)) {
+      Serial.println("Failed to initialize DFPlayer!");
+      Serial.println("Please check the connection and SD card.");
+    } else {
+      Serial.println("DFPlayer Mini initialized!");
+      _dfPlayer.setTimeOut(500); // Set timeout 500ms
+      _dfPlayer.volume(Config::AUDIO_VOLUME); // Set volume
+      _dfPlayer.EQ(DFPLAYER_EQ_NORMAL); // Set EQ
+    }
+  }
+  
+  void play(uint8_t trackNumber) {
+    if (_currentTrack == trackNumber && _isPlaying) {
+      return; // Đã đang phát bản nhạc này rồi
+    }
+    
+    if (millis() - _lastCommandTime < MIN_COMMAND_INTERVAL) {
+      delay(MIN_COMMAND_INTERVAL); // Đảm bảo khoảng cách giữa các lệnh
+    }
+    
+    _dfPlayer.play(trackNumber);
+    _currentTrack = trackNumber;
+    _isPlaying = true;
+    _lastCommandTime = millis();
+    
+    Serial.printf("Playing audio track: %d\n", trackNumber);
+  }
+  
+  void stop() {
+    if (!_isPlaying) {
+      return; // Không đang phát, không cần dừng
+    }
+    
+    if (millis() - _lastCommandTime < MIN_COMMAND_INTERVAL) {
+      delay(MIN_COMMAND_INTERVAL);
+    }
+    
+    _dfPlayer.stop();
+    _isPlaying = false;
+    _lastCommandTime = millis();
+    
+    Serial.println("Audio playback stopped");
+  }
+  
+  void setVolume(uint8_t volume) {
+    if (millis() - _lastCommandTime < MIN_COMMAND_INTERVAL) {
+      delay(MIN_COMMAND_INTERVAL);
+    }
+    
+    _dfPlayer.volume(volume);
+    _lastCommandTime = millis();
+  }
+  
+  bool isPlaying() const {
+    return _isPlaying;
+  }
+  
+  // Singleton pattern
+  static AudioManager& getInstance() {
+    static AudioManager instance;
+    return instance;
+  }
+};
+
 // ===== QUẢN LÝ VIDEO =====
 class VideoManager {
 private:
@@ -143,37 +230,61 @@ public:
   }
   
   void update(PlayerState newState) {
+    PlayerState oldState = _state;
     _state = newState;
     
     // Xử lý các trạng thái đặc biệt
     switch (newState) {
       case PlayerState::SKIP_CURRENT:
+        stopAudioIfNeeded();
         nextVideo();
         _state = PlayerState::NORMAL_PLAYBACK;
         break;
         
       case PlayerState::LOOP_CURRENT:
         _loopCurrentVideo = true;
+        playAudioForCurrentVideo();
         break;
         
-      case PlayerState::PLAY_INTRO_VIDEO:
-        _currentVideoIndex = Config::INTRO_VIDEO_INDEX;
+      case PlayerState::PLAY_SLEEP_VIDEO:
+        _currentVideoIndex = Config::SLEEP_VIDEO_INDEX;
         _currentFrameIndex = 0;
+        playAudioForCurrentVideo();
         break;
         
       case PlayerState::PLAY_SPECIAL_VIDEO:
         _currentVideoIndex = Config::SPECIAL_VIDEO_INDEX;
         _currentFrameIndex = 0;
+        playAudioForCurrentVideo();
         break;
         
       case PlayerState::NORMAL_PLAYBACK:
         _loopCurrentVideo = false;
+        stopAudioIfNeeded();
+        
         // Nếu đang xem video đặc biệt, chuyển sang video thông thường tiếp theo
-        if (_currentVideoIndex == Config::INTRO_VIDEO_INDEX || 
+        if (_currentVideoIndex == Config::SLEEP_VIDEO_INDEX || 
             _currentVideoIndex == Config::SPECIAL_VIDEO_INDEX) {
           nextVideo();
         }
         break;
+    }
+  }
+  
+  void playAudioForCurrentVideo() {
+    // Phát audio nếu đang ở các trạng thái cho phép
+    if (_state == PlayerState::LOOP_CURRENT ||
+        _state == PlayerState::PLAY_SLEEP_VIDEO ||
+        _state == PlayerState::PLAY_SPECIAL_VIDEO) {
+      uint8_t audioIdx = getCurrentVideo()->audio_idx;
+      AudioManager::getInstance().play(audioIdx);
+    }
+  }
+  
+  void stopAudioIfNeeded() {
+    // Dừng audio khi trở về chế độ phát thông thường
+    if (_state == PlayerState::NORMAL_PLAYBACK) {
+      AudioManager::getInstance().stop();
     }
   }
   
@@ -184,6 +295,7 @@ public:
       
       // Chỉ chuyển video nếu không trong chế độ lặp và trạng thái là normal
       if (!_loopCurrentVideo && _state == PlayerState::NORMAL_PLAYBACK) {
+        stopAudioIfNeeded();
         nextVideo();
       }
     }
@@ -197,12 +309,18 @@ public:
         _currentVideoIndex = (_currentVideoIndex + 1) % _videoList.size();
         // Trong chế độ thường, bỏ qua video đặc biệt
       } while (_state == PlayerState::NORMAL_PLAYBACK && 
-              (_currentVideoIndex == Config::INTRO_VIDEO_INDEX || 
+              (_currentVideoIndex == Config::SLEEP_VIDEO_INDEX || 
                _currentVideoIndex == Config::SPECIAL_VIDEO_INDEX));
-    } else if (_state == PlayerState::PLAY_INTRO_VIDEO) {
-      _currentVideoIndex = Config::INTRO_VIDEO_INDEX;
+      
+      stopAudioIfNeeded();
+      
+    } else if (_state == PlayerState::PLAY_SLEEP_VIDEO) {
+      _currentVideoIndex = Config::SLEEP_VIDEO_INDEX;
+      playAudioForCurrentVideo();
+      
     } else if (_state == PlayerState::PLAY_SPECIAL_VIDEO) {
       _currentVideoIndex = Config::SPECIAL_VIDEO_INDEX;
+      playAudioForCurrentVideo();
     }
   }
   
@@ -279,7 +397,7 @@ public:
   PlayerState handleEvent(InputEvent event, const InputState& state) override {
     switch (event) {
       case InputEvent::ADC_HIGH:
-        return PlayerState::PLAY_INTRO_VIDEO;
+        return PlayerState::PLAY_SLEEP_VIDEO;
         
       case InputEvent::ADC_LOW:
         return PlayerState::NORMAL_PLAYBACK;
@@ -512,7 +630,8 @@ public:
   }
 };
 
-// ===== LOGGER =====
+// ===== LOGGER OBSERVER EXAMPLE =====
+// Ví dụ về một observer để ghi log các sự kiện đầu vào
 class InputLogger : public InputObserver {
 public:
   void onInputEvent(InputEvent event, const InputState& state) override {
@@ -544,6 +663,7 @@ void setup() {
   // Khởi tạo các thành phần
   DisplayManager::getInstance().init();
   InputManager::getInstance().init();
+  AudioManager::getInstance().init(); // Khởi tạo AudioManager
   
   // Thêm logger để theo dõi các sự kiện
   InputManager::getInstance().addObserver(logger);
